@@ -47,6 +47,42 @@ kvminit()
   kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
 }
 
+/*
+创建一张新的内核页表；
+把原来全局 kernel_pagetable 里需要的内核映射复制一份进去；
+返回这张新的页表。
+*/
+pagetable_t
+proc_kpagetable(void)
+{
+  pagetable_t kpgtbl;
+
+  kpgtbl = (pagetable_t) kalloc();
+  if(kpgtbl == 0) return 0;
+
+  memset(kpgtbl,0,PGSIZE);
+
+  if(mappages(kpgtbl,UART0,PGSIZE,UART0,PTE_R | PTE_W) != 0) 
+    goto bad;
+  if(mappages(kpgtbl, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W) != 0)
+    goto bad;
+  // if(mappages(kpgtbl, CLINT, 0x10000, CLINT, PTE_R | PTE_W) != 0)
+  //   goto bad;
+  if(mappages(kpgtbl, PLIC, 0x400000, PLIC, PTE_R | PTE_W) != 0)
+    goto bad;
+  if(mappages(kpgtbl, KERNBASE, (uint64)etext - KERNBASE, KERNBASE, PTE_R | PTE_X) != 0)
+    goto bad;
+  if(mappages(kpgtbl, (uint64)etext, PHYSTOP - (uint64)etext, (uint64)etext, PTE_R | PTE_W) != 0)
+    goto bad;
+  if(mappages(kpgtbl, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X) != 0)
+    goto bad;
+
+  return kpgtbl;
+
+  bad:
+    return 0;
+}
+
 // Switch h/w page table register to the kernel's page table,
 // and enable paging.
 void
@@ -269,6 +305,70 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
   return newsz;
 }
 
+int 
+uvm2k(pagetable_t upagetable,pagetable_t kpagetable,uint64 oldsz,uint64 newsz)
+{
+  pte_t *pte;
+  uint64 pa;
+  uint flags;
+
+  if(newsz < oldsz) return 0;
+
+  if(newsz >= PLIC) return -1;
+
+  oldsz = PGROUNDUP(oldsz);
+
+  for(uint64 va = oldsz;va < newsz;va +=PGSIZE){
+    pte = walk(upagetable,va,0);
+    if(pte == 0) panic("uvm2k:pte should exist");
+    if((*pte & PTE_V) == 0) panic("uvm2k:page not present");
+
+    // if((*pte & PTE_U) == 0)
+    //   continue;
+    
+    pa = PTE2PA(*pte);
+
+    flags = PTE_FLAGS(*pte) & ~PTE_U;
+
+    if(mappages(kpagetable,va,PGSIZE,pa,flags) != 0)
+    {
+      uvm2kfree(kpagetable, va, oldsz);
+      return -1;
+    }
+  }
+  return 0;
+}
+
+void
+uvm2kfree(pagetable_t kpagetable,uint64 oldsz,uint64 newsz)
+{
+  if(newsz >= oldsz) return;
+
+  uint64 a = PGROUNDUP(newsz);
+  uint64 old = PGROUNDUP(oldsz);
+
+  // if(a < old)
+  //   uvmunmap(kpagetable,a,(old - a)/PGSIZE,0);
+  for(uint64 va = a; va < old; va += PGSIZE){
+    pte_t *pte = walk(kpagetable, va, 0);
+
+    /*
+     * 有些页没有映射进 kpagetable，例如 guard page。
+     * 这种情况直接跳过。
+     */
+    if(pte == 0)
+      continue;
+    if((*pte & PTE_V) == 0)
+      continue;
+
+    /*
+     * 只清除 kpagetable 里的映射，不释放物理页。
+     * 物理页由用户页表负责释放。
+     */
+    *pte = 0;
+  }
+}
+
 // Recursively free page-table pages.
 // All leaf mappings must already have been removed.
 void
@@ -287,6 +387,70 @@ freewalk(pagetable_t pagetable)
     }
   }
   kfree((void*)pagetable);
+}
+
+void
+proc_free_kpagetable(pagetable_t pagetable)
+{
+  for(int i = 0;i < 512;i++)
+  {
+    pte_t pte = pagetable[i];
+
+    if((pte & PTE_V) && ((pte & (PTE_R | PTE_W | PTE_X)) == 0))
+    {
+      uint64 child = PTE2PA(pte);
+      proc_free_kpagetable((pagetable_t)child);
+      pagetable[i] = 0;
+    } else if (pte & PTE_V){
+      pagetable[i] = 0;
+    }
+  }
+
+  kfree((void*)pagetable);
+}
+
+
+/*
+1. 遍历当前页表的 512 个 PTE。
+2. 如果 PTE_V 有效，就打印这一项。
+3. 如果这个 PTE 不是叶子节点，就说明它指向下一级页表。
+4. 递归打印下一级页表。
+*/
+void
+vmprint_helper(pagetable_t pagetable,int level)
+{
+  for(int i =0;i < 512;i++)
+  {
+    pte_t pte = pagetable[i];
+
+    if(pte & PTE_V)
+    {
+      for(int j = 0;j < level;j++)
+      {
+        if(j == 0) printf("..");
+        else printf(" ..");
+      }
+
+      printf("%d: pte %p pa %p\n",i,pte,PTE2PA(pte));
+
+      /*
+      中间层页表项：只有 PTE_V，没有 PTE_R / PTE_W / PTE_X
+      叶子页表项：除了 PTE_V，还会有 R/W/X 权限位
+      */
+      if((pte & (PTE_R | PTE_W | PTE_X)) == 0) //判断是不是页表叶节点
+      {
+        uint64 child = PTE2PA(pte);
+        vmprint_helper((pagetable_t)child,level + 1);
+      }
+    }
+  }
+}
+
+void
+vmprint(pagetable_t pagetable)
+{
+  printf("page table %p\n",pagetable);
+  vmprint_helper(pagetable,1);
 }
 
 // Free user memory pages,
@@ -379,23 +543,24 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
+  // uint64 n, va0, pa0;
 
-  while(len > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > len)
-      n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
+  // while(len > 0){
+  //   va0 = PGROUNDDOWN(srcva);
+  //   pa0 = walkaddr(pagetable, va0);
+  //   if(pa0 == 0)
+  //     return -1;
+  //   n = PGSIZE - (srcva - va0);
+  //   if(n > len)
+  //     n = len;
+  //   memmove(dst, (void *)(pa0 + (srcva - va0)), n);
 
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  //   len -= n;
+  //   dst += n;
+  //   srcva = va0 + PGSIZE;
+  // }
+  // return 0;
+  return copyin_new(pagetable, dst, srcva, len);
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -405,38 +570,39 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
-  int got_null = 0;
+  // uint64 n, va0, pa0;
+  // int got_null = 0;
 
-  while(got_null == 0 && max > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > max)
-      n = max;
+  // while(got_null == 0 && max > 0){
+  //   va0 = PGROUNDDOWN(srcva);
+  //   pa0 = walkaddr(pagetable, va0);
+  //   if(pa0 == 0)
+  //     return -1;
+  //   n = PGSIZE - (srcva - va0);
+  //   if(n > max)
+  //     n = max;
 
-    char *p = (char *) (pa0 + (srcva - va0));
-    while(n > 0){
-      if(*p == '\0'){
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
+  //   char *p = (char *) (pa0 + (srcva - va0));
+  //   while(n > 0){
+  //     if(*p == '\0'){
+  //       *dst = '\0';
+  //       got_null = 1;
+  //       break;
+  //     } else {
+  //       *dst = *p;
+  //     }
+  //     --n;
+  //     --max;
+  //     p++;
+  //     dst++;
+  //   }
 
-    srcva = va0 + PGSIZE;
-  }
-  if(got_null){
-    return 0;
-  } else {
-    return -1;
-  }
+  //   srcva = va0 + PGSIZE;
+  // }
+  // if(got_null){
+  //   return 0;
+  // } else {
+  //   return -1;
+  // }
+  return copyinstr_new(pagetable, dst, srcva, max);
 }

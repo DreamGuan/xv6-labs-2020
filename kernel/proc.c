@@ -121,6 +121,21 @@ found:
     return 0;
   }
 
+  p->kpagetable = proc_kpagetable();
+  if(p->kpagetable == 0)
+  {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  if(mappages(p->kpagetable,p->kstack,PGSIZE,kvmpa(p->kstack),PTE_R | PTE_W) != 0)
+  {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -142,6 +157,10 @@ freeproc(struct proc *p)
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  if(p->kpagetable)
+    proc_free_kpagetable(p->kpagetable);
+  p->kpagetable = 0;
+
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -221,6 +240,9 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  if(uvm2k(p->pagetable,p->kpagetable,0,p->sz) < 0)
+    panic("userinit:uvm2k");
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -238,18 +260,32 @@ userinit(void)
 int
 growproc(int n)
 {
-  uint sz;
+  uint64 sz;
+  uint64 newsz;
   struct proc *p = myproc();
 
   sz = p->sz;
   if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+    if(sz + n >= PLIC) return -1;
+
+    newsz = uvmalloc(p->pagetable, sz, sz + n);
+
+    if(newsz == 0) return -1;
+    
+    if(uvm2k(p->pagetable, p->kpagetable, sz,newsz) < 0) {
+      uvmdealloc(p->pagetable,newsz,sz);
       return -1;
     }
+
+    sz = newsz;
   } else if(n < 0){
-    sz = uvmdealloc(p->pagetable, sz, sz + n);
+    newsz = sz + n;
+
+    uvm2kfree(p->kpagetable,sz,newsz);
+    sz = uvmdealloc(p->pagetable, sz, newsz);
   }
   p->sz = sz;
+  sfence_vma();
   return 0;
 }
 
@@ -274,6 +310,13 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+
+  if(uvm2k(np->pagetable,np->kpagetable,0,np->sz) < 0)
+  {
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
 
   np->parent = p;
 
@@ -473,8 +516,13 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        w_satp(MAKE_SATP(p->kpagetable));
+        sfence_vma();
+
         swtch(&c->context, &p->context);
 
+        kvminithart();
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;

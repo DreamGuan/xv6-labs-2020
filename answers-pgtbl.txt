@@ -1,0 +1,19 @@
+1. vmprint output explanation
+
+The vmprint output shows the three-level RISC-V Sv39 page table of the first user process, init, just after exec.
+
+The root page table has valid entries such as entry 0 and entry 255. Entry 0 leads to lower-level page tables that map the low user virtual addresses. At the lowest level, entries 0, 1, and 2 correspond to user virtual pages 0, 1, and 2.
+
+Page 0 contains the init program's user text and data. Page 2 contains the user stack. Page 1 is the guard page below the stack. It is mapped in the page table but has its PTE_U bit cleared, so code running in user mode cannot read or write the memory mapped by page 1. If the user stack overflows into that page, the processor will raise a fault.
+
+The high virtual address entries, such as the entries near 255, 511, 510, and 511, correspond to the trapframe and trampoline mappings near the top of the user virtual address space.
+
+2. Why copyin_new() needs the test srcva + len < srcva
+
+The test srcva + len < srcva is needed to detect unsigned 64-bit integer overflow.
+
+For example, suppose:
+srcva = 0x100
+len   = 0xffffffffffffffff
+
+Then srcva itself may be below p->sz, so the first check does not fail. But srcva + len overflows and wraps around to 0xff, which may also be below p->sz, so the second check may not fail either. However, since the wrapped result 0xff is less than the original srcva 0x100, the condition srcva + len < srcva becomes true. This detects the overflow and correctly returns -1.

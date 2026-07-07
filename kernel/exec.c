@@ -48,6 +48,8 @@ exec(char *path, char **argv)
       goto bad;
     if(ph.vaddr + ph.memsz < ph.vaddr)
       goto bad;
+    if(ph.vaddr + ph.memsz >= PLIC)
+      goto bad;
     uint64 sz1;
     if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz)) == 0)
       goto bad;
@@ -110,11 +112,22 @@ exec(char *path, char **argv)
     
   // Commit to the user image.
   oldpagetable = p->pagetable;
+  oldsz = p->sz;
+
+  uvm2kfree(p->kpagetable,oldsz,0);
   p->pagetable = pagetable;
   p->sz = sz;
+
+  if(uvm2k(p->pagetable,p->kpagetable,0,p->sz) < 0) goto bad;
+
+  sfence_vma();
+
   p->trapframe->epc = elf.entry;  // initial program counter = main
   p->trapframe->sp = sp; // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);
+
+
+  if(p->pid == 1) vmprint(p->pagetable);
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 
