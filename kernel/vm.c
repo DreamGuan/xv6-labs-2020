@@ -5,6 +5,9 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
+
 
 /*
  * the kernel's page table.
@@ -111,6 +114,110 @@ walkaddr(pagetable_t pagetable, uint64 va)
   return pa;
 }
 
+/*
+ * 为系统调用访问的合法 lazy 用户地址分配物理页。
+ *
+ * 返回值：
+ *   成功：返回该虚拟页对应的物理地址；
+ *   失败：返回 0。
+ *
+ * 这个函数只供 copyin、copyout、copyinstr 使用，
+ * 所以声明为 static，不需要写进 kernel/defs.h。
+ */
+static uint64
+lazywalkaddr(pagetable_t pagetable, uint64 va)
+{
+  /*
+   * 系统调用正在为当前进程工作。
+   */
+  struct proc *p = myproc();
+
+  /*
+   * 将用户地址对齐到页面起始地址。
+   */
+  uint64 va0 = PGROUNDDOWN(va);
+
+  /*
+   * 没有当前进程时不能进行 lazy allocation。
+   */
+  if(p == 0)
+    return 0;
+
+  /*
+   * copyout() 有时也可能操作一个尚未安装为当前进程页表的
+   * 临时页表，例如 exec() 构造新地址空间时。
+   *
+   * Lazy sbrk 页面只属于当前进程的正式用户页表。
+   * 因此页表不相同时保持原来的失败行为。
+   */
+  if(pagetable != p->pagetable)
+    return 0;
+
+  /*
+   * 地址必须位于进程通过 sbrk() 获得的合法范围内。
+   */
+  if(va0 >= p->sz)
+    return 0;
+
+  /*
+   * 地址不能位于用户栈页面下方。
+   *
+   * 这样可以防止系统调用绕过栈保护页。
+   */
+  if(va0 < PGROUNDDOWN(p->trapframe->sp))
+    return 0;
+
+  /*
+   * 检查地址是否已经存在有效页表项。
+   *
+   * walkaddr() 可能因为 PTE_U 未设置而返回 0，
+   * 例如栈保护页。
+   *
+   * 已有有效 PTE 时绝不能重新映射。
+   */
+  pte_t *pte = walk(pagetable, va0, 0);
+
+  if(pte != 0 && (*pte & PTE_V))
+    return 0;
+
+  /*
+   * 分配一个新的物理页。
+   */
+  char *mem = kalloc();
+
+  if(mem == 0)
+    return 0;
+
+  /*
+   * 新用户页面清零。
+   */
+  memset(mem, 0, PGSIZE);
+
+  /*
+   * 建立用户虚拟页到物理页的映射。
+   */
+  if(mappages(
+       pagetable,
+       va0,
+       PGSIZE,
+       (uint64)mem,
+       PTE_R | PTE_W | PTE_U
+     ) != 0){
+    /*
+     * 映射失败时释放页面。
+     */
+    kfree(mem);
+    return 0;
+  }
+
+  /*
+   * 重新通过 walkaddr() 得到物理地址。
+   *
+   * 映射成功后这里应当返回非零值。
+   */
+  return walkaddr(pagetable, va0);
+}
+
 // add a mapping to the kernel page table.
 // only used when booting.
 // does not flush TLB or enable paging.
@@ -180,16 +287,41 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
     panic("uvmunmap: not aligned");
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
-    if((pte = walk(pagetable, a, 0)) == 0)
-      panic("uvmunmap: walk");
-    if((*pte & PTE_V) == 0)
-      panic("uvmunmap: not mapped");
+
+    /*
+     * 查询虚拟地址 a 对应的页表项。
+     * alloc=0 表示查询过程中不创建页表。
+     */
+    pte = walk(pagetable,a,0);
+
+    /*
+     * Lazy allocation 允许页面尚未建立映射。
+     * 如果对应页表结构不存在，直接跳过。
+     */
+    if(pte == 0)  continue;
+
+    /*
+     * Lazy allocation 允许页面尚未建立映射。
+     * 如果对应页表结构不存在，直接跳过。
+     */
+    if((*pte & PTE_V) == 0) continue;
+
+     /*
+     * 这里应该是叶子页表项。
+     * 非叶子项说明页表结构不符合预期。
+     */
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
+
+    /*
+     * 根据参数决定是否释放真实物理页。
+     */
     if(do_free){
       uint64 pa = PTE2PA(*pte);
       kfree((void*)pa);
     }
+
+    
     *pte = 0;
   }
 }
@@ -314,10 +446,32 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
+    // if((pte = walk(old, i, 0)) == 0)
+    //   panic("uvmcopy: pte should exist");
+    // if((*pte & PTE_V) == 0)
+    //   panic("uvmcopy: page not present");
+
+    /*
+     * 查询父进程虚拟地址 i 对应的页表项。
+     *
+     * Lazy allocation 允许 0 ～ sz 之间存在尚未映射的页面。
+     * 如果 walk() 返回 0，说明该地址没有对应页表结构。
+     * 这种页面在子进程中也应该保持未映射，因此直接跳过。
+     */
     if((pte = walk(old, i, 0)) == 0)
-      panic("uvmcopy: pte should exist");
+      continue;
+
+    /*
+     * 如果页表项存在但 PTE_V 没有置位，
+     * 说明该页面尚未建立有效映射。
+     *
+     * 这通常表示父进程通过 sbrk() 申请了这段空间，
+     * 但从未真正访问过。
+     *
+     * 子进程也不需要提前分配该页面，直接跳过。
+     */
     if((*pte & PTE_V) == 0)
-      panic("uvmcopy: page not present");
+      continue;
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
@@ -357,10 +511,40 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
   uint64 n, va0, pa0;
 
   while(len > 0){
+    // va0 = PGROUNDDOWN(dstva);
+    // pa0 = walkaddr(pagetable, va0);
+    // if(pa0 == 0)
+    //   return -1;
+
+    /*
+     * dstva 是内核准备写入的用户虚拟地址。
+     */
     va0 = PGROUNDDOWN(dstva);
+
+    /*
+     * 首先正常查询页表映射。
+     */
     pa0 = walkaddr(pagetable, va0);
+
+    /*
+     * 尚未映射时，尝试把它作为合法 lazy 页面进行分配。
+     */
+    if(pa0 == 0)
+      pa0 = lazywalkaddr(pagetable, va0);
+
+    /*
+     * 仍然为 0，说明：
+     *
+     *   1. 地址超过 p->sz；
+     *   2. 地址位于栈保护区；
+     *   3. 页表不是当前进程页表；
+     *   4. kalloc() 失败；
+     *   5. 映射失败；
+     *   6. 页面存在但用户没有权限访问。
+     */
     if(pa0 == 0)
       return -1;
+
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
@@ -382,10 +566,24 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
   uint64 n, va0, pa0;
 
   while(len > 0){
+    // va0 = PGROUNDDOWN(srcva);
+    // pa0 = walkaddr(pagetable, va0);
+    // if(pa0 == 0)
+    //   return -1;
     va0 = PGROUNDDOWN(srcva);
+
     pa0 = walkaddr(pagetable, va0);
+
+    /*
+     * write() 等系统调用需要从用户缓冲区读取数据。
+     * 若该页面是合法 lazy 页面，就先分配它。
+     */
+    if(pa0 == 0)
+      pa0 = lazywalkaddr(pagetable, va0);
+
     if(pa0 == 0)
       return -1;
+
     n = PGSIZE - (srcva - va0);
     if(n > len)
       n = len;
@@ -409,8 +607,18 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   int got_null = 0;
 
   while(got_null == 0 && max > 0){
+    // va0 = PGROUNDDOWN(srcva);
+    // pa0 = walkaddr(pagetable, va0);
+
     va0 = PGROUNDDOWN(srcva);
     pa0 = walkaddr(pagetable, va0);
+
+    /*
+     * 字符串也可能存放在尚未实际分配的 lazy 页面中。
+     */
+    if(pa0 == 0)
+      pa0 = lazywalkaddr(pagetable, va0);
+
     if(pa0 == 0)
       return -1;
     n = PGSIZE - (srcva - va0);

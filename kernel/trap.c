@@ -65,13 +65,122 @@ usertrap(void)
     intr_on();
 
     syscall();
+  // } else if((which_dev = devintr()) != 0){
+  //   // ok
+  // } else {
+  //   printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+  //   printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+  //   p->killed = 1;
+  // }
+  } else if(r_scause() == 13 || r_scause() == 15){
+    /*
+     * scause == 13：Load page fault
+     * scause == 15：Store/AMO page fault
+     *
+     * 这里只处理用户读写 lazy 页面产生的缺页异常。
+     * 指令缺页 scause == 12 不在这里处理。
+     */
+
+    /*
+     * stval 保存发生缺页的具体用户虚拟地址。
+     */
+    uint64 faultva = r_stval();
+
+    /*
+     * 内存分配和映射必须以页面为单位。
+     *
+     * 例如：
+     *   faultva = 0x4008
+     *   va      = 0x4000
+     */
+    uint64 va = PGROUNDDOWN(faultva);
+
+    /*
+     * 情况一：
+     * 故障地址已经超过通过 sbrk() 获得的地址空间。
+     *
+     * 这种地址不是合法 lazy 页面，应该终止进程。
+     *
+     * 情况二：
+     * 故障地址位于当前用户栈页面下方。
+     *
+     * 这可能是在访问栈保护页，同样不能为它分配页面。
+     */
+    if(faultva >= p->sz ||
+       faultva < PGROUNDDOWN(p->trapframe->sp)){
+      p->killed = 1;
+    } else {
+      /*
+       * 查询该地址是否已经存在有效的页表项。
+       *
+       * 如果已经有有效 PTE，却仍然发生 page fault，
+       * 说明这更可能是页面权限问题，而不是 lazy 页面尚未分配。
+       *
+       * 例如栈保护页可能拥有有效 PTE，
+       * 但没有 PTE_U 用户访问权限。
+       */
+      pte_t *pte = walk(p->pagetable, va, 0);
+
+      if(pte != 0 && (*pte & PTE_V)){
+        /*
+         * 已经存在有效映射，不能再次 mappages()，
+         * 否则会触发 panic: remap。
+         */
+        p->killed = 1;
+      } else {
+        /*
+         * 这是一个合法但尚未映射的 lazy 页面。
+         * 从空闲物理页链表中分配一页。
+         */
+        char *mem = kalloc();
+
+        if(mem == 0){
+          /*
+           * 物理内存耗尽。
+           * 只终止当前用户进程，不让内核 panic。
+           */
+          p->killed = 1;
+        } else {
+          /*
+           * 新分配的用户页面必须清零。
+           */
+          memset(mem, 0, PGSIZE);
+
+          /*
+           * 建立虚拟地址 va 到物理页面 mem 的映射。
+           *
+           * 权限：
+           *   PTE_R：可读
+           *   PTE_W：可写
+           *   PTE_U：用户态可访问
+           *
+           * 不添加 PTE_X，因为 sbrk() 扩展的是数据页面，
+           * 不是程序代码页面。
+           */
+          if(mappages(p->pagetable,
+                      va,
+                      PGSIZE,
+                      (uint64)mem,
+                      PTE_R | PTE_W | PTE_U) != 0){
+            /*
+             * 映射失败时，释放刚分配的物理页，
+             * 避免内存泄漏。
+             */
+            kfree(mem);
+            p->killed = 1;
+          }
+        }
+      }
+    }
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else {
-    printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
-    printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
-    p->killed = 1;
-  }
+} else {
+  printf("usertrap(): unexpected scause %p pid=%d\n",
+         r_scause(), p->pid);
+  printf("            sepc=%p stval=%p\n",
+         r_sepc(), r_stval());
+  p->killed = 1;
+}
 
   if(p->killed)
     exit(-1);
