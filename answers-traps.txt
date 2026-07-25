@@ -1,0 +1,62 @@
+1. Which registers contain arguments to functions? For example, which register holds 13 in main's call to printf?
+
+The RISC-V calling convention passes function arguments in registers a0 through a7. In the call to printf, a0 contains the address of the format string, a1 contains 12, and a2 contains 13. Therefore, 13 is stored in register a2.
+
+
+2. Where is the call to function f in the assembly code for main? Where is the call to g?
+
+There is no actual call to f in main, and there is no actual call to g. The compiler inlined and constant-folded the expressions. It directly loads 12 into a1 with:
+
+li a1, 12
+
+This is the precomputed result of f(8) + 1.
+
+
+3. At what address is the function printf located?
+
+printf is located at address 0x630.
+
+
+4. What value is in register ra just after the jalr instruction that calls printf in main?
+
+The jalr instruction that calls printf is located at address 0x34. The next instruction is located at address 0x38, so ra contains 0x38 after the jalr instruction.
+
+
+5. What is the output of the following code?
+
+unsigned int i = 0x00646c72;
+printf("H%x Wo%s", 57616, &i);
+
+The output is:
+
+He110 World
+
+57616 is 0xe110 in hexadecimal.
+
+RISC-V is little-endian, so i = 0x00646c72 is stored in memory
+from low address to high address as:
+
+0x72 0x6c 0x64 0x00
+
+These bytes represent the string "rld".
+
+On a big-endian machine, i should be set to:
+
+0x726c6400
+
+This causes the bytes in memory to remain 0x72, 0x6c, 0x64, 0x00.
+
+57616 does not need to change because %x prints the numeric value,
+not the byte order of its memory representation.
+
+
+6. What is printed after y= in the following code, and why?
+
+printf("x=%d y=%d", 3);
+
+The value printed after y= is indeterminate and is not a specific value.
+
+The format string requires two integer arguments, but only one integer,
+3, is supplied. printf reads the missing second argument from the
+register or argument area where that argument would normally be stored.
+That location contains an unrelated leftover value.

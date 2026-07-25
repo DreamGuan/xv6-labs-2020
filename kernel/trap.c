@@ -77,8 +77,32 @@ usertrap(void)
     exit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
-    yield();
+  if(which_dev == 2){
+  /*
+   * 只有启用了 alarm，并且当前没有正在执行 handler 时，
+   * 才累加 alarm ticks。
+   */
+  if(p->alarm_interval > 0 && p->alarm_active == 0){
+    p->alarm_ticks++;
+
+    if(p->alarm_ticks >= p->alarm_interval){
+      /*
+       * 保存被中断时的全部用户寄存器。
+       */
+      p->alarm_trapframe = *(p->trapframe);
+
+      /*
+       * usertrapret() 返回用户态时，将从 handler 开始执行。
+       */
+      p->trapframe->epc = p->alarm_handler;
+
+      p->alarm_ticks = 0;
+      p->alarm_active = 1;
+    }
+  }
+
+  yield();
+}
 
   usertrapret();
 }
