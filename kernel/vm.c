@@ -309,28 +309,79 @@ int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
   pte_t *pte;
-  uint64 pa, i;
-  uint flags;
-  char *mem;
+  uint64 pa;
+  uint64 i;
+  uint64 flags;
 
   for(i = 0; i < sz; i += PGSIZE){
+    /*
+     * 找到父进程中虚拟地址 i 对应的 PTE。
+     */
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
+
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
+
+    /*
+     * 取出父进程当前页面对应的物理地址和权限。
+     */
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+
+    /*
+     * 只有原本可以写入的页面，才需要转换成 COW。
+     *
+     * 原本只读的代码页不能添加 PTE_COW，
+     * 否则用户程序写代码页时，内核会错误地
+     * 给代码页恢复写权限。
+     */
+    if(flags & PTE_W){
+      flags &= ~PTE_W;
+      flags |= PTE_COW;
+
+      /*
+       * 父进程自己的页面也必须取消写权限。
+       *
+       * 如果只修改子进程，父进程仍然可以直接
+       * 修改共享物理页，子进程会看到错误的数据变化。
+       */
+      *pte = PA2PTE(pa) | flags;
+
+      /*
+       * 父进程可能已经在 TLB 中缓存了旧的可写 PTE，
+       * 更新页表后清空 TLB，避免继续使用旧权限。
+       */
+      sfence_vma();
     }
+
+    /*
+     * 子进程映射到同一个物理页 pa。
+     *
+     * 这里没有调用 kalloc()，也没有调用 memmove()。
+     */
+    if(mappages(new, i, PGSIZE, pa, flags) != 0)
+      goto err;
+
+    /*
+     * 子进程新增了一个对该物理页的引用。
+     *
+     * 无论是 COW 数据页还是原生只读代码页，
+     * 子进程都新增了一个 PTE，所以都必须加一。
+     */
+    krefinc((void *)pa);
   }
+
   return 0;
 
- err:
+err:
+  /*
+   * 释放已经建立的子进程映射。
+   *
+   * do_free 为 1 时会调用 kfree()。
+   * 新版 kfree() 只会减少引用计数，
+   * 不会提前释放父进程仍然使用的页面。
+   */
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
@@ -348,28 +399,163 @@ uvmclear(pagetable_t pagetable, uint64 va)
   *pte &= ~PTE_U;
 }
 
+int
+cowalloc(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 oldpa;
+  uint64 flags;
+  char *mem;
+
+  /*
+   * stval 记录的可能是页面内部某个地址，
+   * 页表查询必须使用页面起始地址。
+   */
+  va = PGROUNDDOWN(va);
+
+  if(va >= MAXVA)
+    return -1;
+
+  pte = walk(pagetable, va, 0);
+
+  if(pte == 0)
+    return -1;
+
+  /*
+   * 必须同时满足：
+   *
+   * PTE_V   页面映射有效
+   * PTE_U   用户进程可以访问
+   * PTE_COW 这是 COW 页面
+   *
+   * 如果只是普通只读页，不能复制并恢复写权限。
+   */
+  if((*pte & PTE_V) == 0)
+    return -1;
+
+  if((*pte & PTE_U) == 0)
+    return -1;
+
+  if((*pte & PTE_COW) == 0)
+    return -1;
+
+  oldpa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+
+  /*
+   * 为发生写入的进程分配一个新物理页。
+   * kalloc() 会自动把新页面引用计数设为 1。
+   */
+  mem = kalloc();
+
+  if(mem == 0)
+    return -1;
+
+  /*
+   * 把共享旧页面的全部内容复制到新页面。
+   */
+  memmove(mem, (char *)oldpa, PGSIZE);
+
+  /*
+   * 新页面已经属于当前进程自己：
+   *
+   * 恢复写权限；
+   * 清除 COW 标志。
+   */
+  flags |= PTE_W;
+  flags &= ~PTE_COW;
+
+  /*
+   * 直接替换当前 PTE。
+   *
+   * 不能直接调用 mappages()，因为这个虚拟地址
+   * 已经存在有效映射，否则会触发 panic("remap")。
+   */
+  *pte = PA2PTE((uint64)mem) | flags;
+
+  /*
+   * 清除旧的 TLB 缓存。
+   */
+  sfence_vma();
+
+  /*
+   * 当前进程不再引用旧页面。
+   *
+   * kfree() 会将旧页面引用计数减一；
+   * 只有计数变为 0 才真正释放。
+   */
+  kfree((void *)oldpa);
+
+  return 0;
+}
+
 // Copy from kernel to user.
 // Copy len bytes from src to virtual address dstva in a given page table.
 // Return 0 on success, -1 on error.
 int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
-  uint64 n, va0, pa0;
+  uint64 n;
+  uint64 va0;
+  uint64 pa0;
+  pte_t *pte;
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+
+    if(va0 >= MAXVA)
+      return -1;
+
+    /*
+     * 先直接检查用户页表中的 PTE。
+     */
+    pte = walk(pagetable, va0, 0);
+
+    if(pte == 0)
+      return -1;
+
+    if((*pte & PTE_V) == 0)
+      return -1;
+
+    if((*pte & PTE_U) == 0)
+      return -1;
+
+    /*
+     * 如果目标页面是 COW 页面，
+     * 先为当前进程创建独立的可写副本。
+     */
+    if(*pte & PTE_COW){
+      if(cowalloc(pagetable, va0) < 0)
+        return -1;
+    } else if((*pte & PTE_W) == 0){
+      /*
+       * 页面不可写，又不是 COW 页面，
+       * 说明它是真正的只读页面。
+       */
+      return -1;
+    }
+
+    /*
+     * cowalloc() 可能已经修改了 PTE，
+     * 所以必须重新查询物理地址。
+     */
     pa0 = walkaddr(pagetable, va0);
+
     if(pa0 == 0)
       return -1;
+
     n = PGSIZE - (dstva - va0);
+
     if(n > len)
       n = len;
+
     memmove((void *)(pa0 + (dstva - va0)), src, n);
 
     len -= n;
     src += n;
     dstva = va0 + PGSIZE;
   }
+
   return 0;
 }
 

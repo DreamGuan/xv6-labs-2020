@@ -67,6 +67,22 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if(r_scause() == 15){
+      /*
+       * scause == 15 表示 Store/AMO page fault。
+       *
+       * COW 页面是可读但不可写，所以只有写入时
+       * 才会进入这里。
+       */
+    uint64 va = r_stval();
+    /*
+     * va >= p->sz 表示访问超出进程合法地址空间。
+     *
+     * cowalloc() 还会检查：
+     * PTE_V、PTE_U 和 PTE_COW。
+     */
+    if(va >= p->sz || cowalloc(p->pagetable,va) < 0)
+      p->killed = 1;
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
