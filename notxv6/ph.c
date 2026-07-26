@@ -16,6 +16,7 @@ struct entry {
 struct entry *table[NBUCKET];
 int keys[NKEYS];
 int nthread = 1;
+pthread_mutex_t locks[NBUCKET];
 
 double
 now()
@@ -35,36 +36,73 @@ insert(int key, int value, struct entry **p, struct entry *n)
   *p = e;
 }
 
-static 
-void put(int key, int value)
+static
+void
+put(int key, int value)
 {
+  /*
+   * 计算 key 属于哪个哈希桶。
+   */
   int i = key % NBUCKET;
 
-  // is the key already present?
+  /*
+   * 只锁住当前 key 对应的桶。
+   *
+   * 同一个桶的链表查找和修改不能并发进行；
+   * 不同桶仍然可以被其他线程同时访问。
+   */
+  pthread_mutex_lock(&locks[i]);
+
+  /*
+   * 检查 key 是否已经存在。
+   */
   struct entry *e = 0;
-  for (e = table[i]; e != 0; e = e->next) {
-    if (e->key == key)
+
+  for(e = table[i]; e != 0; e = e->next){
+    if(e->key == key)
       break;
   }
+
   if(e){
-    // update the existing key.
+    /*
+     * key 已存在，更新 value。
+     */
     e->value = value;
   } else {
-    // the new is new.
+    /*
+     * key 不存在，在当前桶的链表头插入新节点。
+     */
     insert(key, value, &table[i], table[i]);
   }
+
+  /*
+   * 当前桶操作完成，释放锁。
+   */
+  pthread_mutex_unlock(&locks[i]);
 }
 
 static struct entry*
 get(int key)
 {
+  /*
+   * 计算 key 所属的桶。
+   */
   int i = key % NBUCKET;
 
+  /*
+   * 锁住当前桶，避免读取链表时，
+   * 另一个线程同时修改该桶的链表结构。
+   */
+  pthread_mutex_lock(&locks[i]);
 
   struct entry *e = 0;
-  for (e = table[i]; e != 0; e = e->next) {
-    if (e->key == key) break;
+
+  for(e = table[i]; e != 0; e = e->next){
+    if(e->key == key)
+      break;
   }
+
+  pthread_mutex_unlock(&locks[i]);
 
   return e;
 }
@@ -108,6 +146,14 @@ main(int argc, char *argv[])
     exit(-1);
   }
   nthread = atoi(argv[1]);
+
+  /*
+   * 初始化每一个哈希桶对应的锁。
+   */
+  for(int i = 0; i < NBUCKET; i++){
+    pthread_mutex_init(&locks[i], NULL);
+  }
+  
   tha = malloc(sizeof(pthread_t) * nthread);
   srandom(0);
   assert(NKEYS % nthread == 0);

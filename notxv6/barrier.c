@@ -22,15 +22,68 @@ barrier_init(void)
   bstate.nthread = 0;
 }
 
-static void 
+static void
 barrier()
 {
-  // YOUR CODE HERE
-  //
-  // Block until all threads have called barrier() and
-  // then increment bstate.round.
-  //
-  
+  /*
+   * bstate.nthread 和 bstate.round 是所有线程共享的数据，
+   * 在读取和修改它们之前必须先获得锁。
+   */
+  pthread_mutex_lock(&bstate.barrier_mutex);
+
+  /*
+   * 记录当前线程进入屏障时所在的轮次。
+   *
+   * 后面等待时，通过比较这个局部变量和 bstate.round，
+   * 判断当前这一轮是否已经结束。
+   */
+  int round = bstate.round;
+
+  /*
+   * 当前线程已经到达这一轮屏障。
+   */
+  bstate.nthread++;
+
+  if(bstate.nthread == nthread){
+    /*
+     * 当前线程是最后一个到达屏障的线程。
+     *
+     * 所有线程已经到齐，可以结束当前轮。
+     */
+
+    /*
+     * 为下一轮重新计数。
+     */
+    bstate.nthread = 0;
+
+    /*
+     * 进入下一轮。
+     *
+     * 等待线程会通过 round 的变化判断当前轮已经结束。
+     */
+    bstate.round++;
+
+    /*
+     * 唤醒所有正在 barrier_cond 上等待的线程。
+     */
+    pthread_cond_broadcast(&bstate.barrier_cond);
+  } else {
+    /*
+     * 当前还不是最后一个到达的线程，
+     * 必须等待当前轮结束。
+     */
+    while(round == bstate.round){
+      pthread_cond_wait(
+        &bstate.barrier_cond,
+        &bstate.barrier_mutex
+      );
+    }
+  }
+
+  /*
+   * 离开 barrier() 前释放互斥锁。
+   */
+  pthread_mutex_unlock(&bstate.barrier_mutex);
 }
 
 static void *
