@@ -21,12 +21,15 @@ struct run {
 struct {
   struct spinlock lock;
   struct run *freelist;
-} kmem;
+} kmem[NCPU];
 
 void
 kinit()
 {
-  initlock(&kmem.lock, "kmem");
+  for(int i = 0; i < NCPU; i++){
+    initlock(&kmem[i].lock, "kmem");
+  }
+
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -48,18 +51,30 @@ kfree(void *pa)
 {
   struct run *r;
 
-  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+  if(((uint64)pa % PGSIZE) != 0 ||
+     (char*)pa < end ||
+     (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
+  // 填充垃圾值，帮助发现悬空引用。
   memset(pa, 1, PGSIZE);
 
   r = (struct run*)pa;
 
-  acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  release(&kmem.lock);
+  /*
+   * cpuid() 只能在中断关闭期间安全使用。
+   */
+  push_off();
+  int id = cpuid();
+
+  acquire(&kmem[id].lock);
+
+  r->next = kmem[id].freelist;
+  kmem[id].freelist = r;
+
+  release(&kmem[id].lock);
+
+  pop_off();
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -68,15 +83,48 @@ kfree(void *pa)
 void *
 kalloc(void)
 {
-  struct run *r;
+  struct run *r = 0;
 
-  acquire(&kmem.lock);
-  r = kmem.freelist;
+  push_off();
+  int id = cpuid();
+
+  /*
+   * 第一步：优先从当前 CPU 的 freelist 分配。
+   */
+  acquire(&kmem[id].lock);
+
+  r = kmem[id].freelist;
   if(r)
-    kmem.freelist = r->next;
-  release(&kmem.lock);
+    kmem[id].freelist = r->next;
+
+  release(&kmem[id].lock);
+
+  /*
+   * 第二步：当前 CPU 没有空闲页，
+   * 依次查看其他 CPU 的 freelist。
+   */
+  if(r == 0){
+    for(int i = 0; i < NCPU; i++){
+      if(i == id)
+        continue;
+
+      acquire(&kmem[i].lock);
+
+      r = kmem[i].freelist;
+      if(r)
+        kmem[i].freelist = r->next;
+
+      release(&kmem[i].lock);
+
+      if(r)
+        break;
+    }
+  }
+
+  pop_off();
 
   if(r)
-    memset((char*)r, 5, PGSIZE); // fill with junk
+    memset((char*)r, 5, PGSIZE);
+
   return (void*)r;
 }
